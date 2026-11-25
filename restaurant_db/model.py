@@ -100,4 +100,12 @@ def normalize_command(value: Any) -> dict[str, Any]:
         fields(value, {"op", "slot_id", "user_id"}, "reserve")
         return {"op": op, "slot_id": text(value["slot_id"], "slot_id"),
                 "user_id": text(value["user_id"], "user_id")}
-    raise ValidationError("unknown op; expected add_table, prepare_batch, publish_batch or reserve")
+    if op == "cancel":
+        fields(value, {"op", "reservation_id", "user_id"}, "cancel")
+        reservation_id = value["reservation_id"]
+        # bool is a subclass of int in Python; True must not mean reservation 1.
+        if type(reservation_id) is not int or reservation_id <= 0:
+            raise ValidationError("reservation_id must be a positive integer")
+        return {"op": op, "reservation_id": reservation_id,
+                "user_id": text(value["user_id"], "user_id")}
+    raise ValidationError("unknown op; expected add_table, prepare_batch, publish_batch, reserve or cancel")

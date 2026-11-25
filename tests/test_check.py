@@ -41,7 +41,8 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(self.journal.stat().st_size, report["journal"]["valid_bytes"])
         self.assertEqual(0, report["journal"]["incomplete_tail_bytes"])
         self.assertEqual({"tables": 1, "batches": 1, "published_batches": 1, "slots": 1,
-                          "reservations": 1, "active_reservations": 1, "requests": 5}, report["state"])
+                          "reservations": 1, "cancelled_reservations": 0,
+                          "active_reservations": 1, "requests": 5}, report["state"])
         self.assertEqual(before, self.file_contents())
 
     def test_incomplete_tail_is_reported_before_explicit_writable_recovery(self):

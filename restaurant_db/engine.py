@@ -38,7 +38,8 @@ class Database:
         self._slots: dict[str, Slot] = {}
         self._batches: dict[str, Batch] = {}
         self._reservations: dict[int, Reservation] = {}
-        # History and active ownership are separate so cancellation can be added.
+        # Creation history stays immutable; cancellation records its own time.
+        self._cancelled: dict[int, str] = {}
         self._active: dict[str, int] = {}
         self._requests: dict[str, dict[str, Any]] = {}
         self._next_reservation_id = 1
@@ -71,6 +72,7 @@ class Database:
                 "state": {"tables": len(db._tables), "batches": len(db._batches),
                           "published_batches": sum(batch.published for batch in db._batches.values()),
                           "slots": len(db._slots), "reservations": len(db._reservations),
+                          "cancelled_reservations": len(db._cancelled),
                           "active_reservations": len(db._active), "requests": len(db._requests)},
             }
 
@@ -127,6 +129,8 @@ class Database:
                 return rejection("batch_not_found")
             return success("batch_published", batch_id=batch.batch_id,
                            slot_count=len(batch.slot_ids))
+        if op == "cancel":
+            return self._plan_cancel(command, at)
 
         slot = self._slots.get(command["slot_id"])
         if slot is None:
@@ -138,6 +142,17 @@ class Database:
         reservation = Reservation(self._next_reservation_id, slot.slot_id,
                                   command["user_id"], at)
         return success("reserved", reservation=asdict(reservation))
+
+    def _plan_cancel(self, command: dict[str, Any], at: str) -> dict[str, Any]:
+        reservation = self._reservations.get(command["reservation_id"])
+        if reservation is None:
+            return rejection("reservation_not_found")
+        if reservation.user_id != command["user_id"]:
+            return rejection("reservation_not_owner")
+        if reservation.reservation_id in self._cancelled:
+            return rejection("reservation_already_cancelled")
+        return success("cancelled", reservation_id=reservation.reservation_id,
+                       slot_id=reservation.slot_id, cancelled_at=at)
 
     def _plan_batch(self, command: dict[str, Any]) -> dict[str, Any]:
         if command["batch_id"] in self._batches:
@@ -186,6 +201,12 @@ class Database:
             self._reservations[reservation.reservation_id] = reservation
             self._active[reservation.slot_id] = reservation.reservation_id
             self._next_reservation_id += 1
+        elif op == "cancel":
+            reservation = self._reservations[command["reservation_id"]]
+            if self._active.get(reservation.slot_id) != reservation.reservation_id:
+                raise CorruptJournal("Cannot cancel a reservation that does not own its slot")
+            self._cancelled[reservation.reservation_id] = result["cancelled_at"]
+            del self._active[reservation.slot_id]
 
     def _replay(self, record: dict[str, Any]) -> None:
         try:
@@ -221,7 +242,8 @@ class Database:
         return {"tables": [asdict(item) for item in self._tables.values()],
                 "batches": [asdict(item) for item in self._batches.values()],
                 "slots": [asdict(item) for item in self._slots.values()],
-                "reservations": [asdict(item) for item in self._reservations.values()],
+                "reservations": [dict(asdict(item), cancelled_at=self._cancelled.get(item.reservation_id))
+                                 for item in self._reservations.values()],
                 "active_reservations": dict(self._active),
                 "request_count": len(self._requests)}
 
