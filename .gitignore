@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+data/
+demo-data/
+race-data/
+build/
+dist/
+tests/.test-data/
