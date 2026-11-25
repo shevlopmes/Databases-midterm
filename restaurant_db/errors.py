@@ -17,6 +17,10 @@ class OwnershipError(DatabaseError):
     pass
 
 
+class ReadOnlyError(DatabaseError):
+    pass
+
+
 class IdempotencyConflict(DatabaseError):
     pass
 

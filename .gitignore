@@ -8,3 +8,4 @@ race-data/
 build/
 dist/
 tests/.test-data/
+.idea

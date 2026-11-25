@@ -9,8 +9,8 @@ import threading
 from typing import Any
 
 from .errors import (CorruptJournal, IdempotencyConflict, OwnershipError,
-                     StorageUnavailable, ValidationError)
-from .journal import Journal
+                     ReadOnlyError, StorageUnavailable, ValidationError)
+from .journal import Journal, canonical_json
 from .model import Batch, Reservation, Slot, Table, normalize_command, text, timestamp
 
 
@@ -29,8 +29,9 @@ class Database:
     engine from concurrent threads. The HTTP adapter uses a synchronous server.
     """
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, *, read_only: bool = False):
         self._owner = (os.getpid(), threading.get_ident())
+        self._read_only = read_only
         self._closed = False
         self._failed = False
         self._tables: dict[str, Table] = {}
@@ -41,13 +42,37 @@ class Database:
         self._active: dict[str, int] = {}
         self._requests: dict[str, dict[str, Any]] = {}
         self._next_reservation_id = 1
-        self._journal = Journal(Path(directory))
+        self._journal = Journal(Path(directory), read_only=read_only)
         try:
             for record in self._journal.transactions():
                 self._replay(record)
+            if not read_only:
+                self._journal.finish_recovery()
         except BaseException:
             self._journal.close()
             raise
+
+    @classmethod
+    def check(cls, directory: str | Path) -> dict[str, Any]:
+        """Validate a stable journal without creating, truncating or syncing it.
+
+        This acquires the ordinary exclusive ownership lock, so the live server
+        must be stopped. A full replay also checks business-state consistency.
+        """
+        with cls(directory, read_only=True) as db:
+            journal = db._journal
+            return {
+                "status": "incomplete_tail" if journal.incomplete_tail_bytes else "ok",
+                "read_only": True,
+                "journal": {"total_bytes": journal.total_bytes,
+                            "valid_bytes": journal.valid_bytes,
+                            "complete_records": journal.valid_records,
+                            "incomplete_tail_bytes": journal.incomplete_tail_bytes},
+                "state": {"tables": len(db._tables), "batches": len(db._batches),
+                          "published_batches": sum(batch.published for batch in db._batches.values()),
+                          "slots": len(db._slots), "reservations": len(db._reservations),
+                          "active_reservations": len(db._active), "requests": len(db._requests)},
+            }
 
     @property
     def recovered_tail_bytes(self) -> int:
@@ -63,6 +88,8 @@ class Database:
 
     def execute(self, request_id: str, command: dict[str, Any]) -> dict[str, Any]:
         self._check_owner()
+        if self._read_only:
+            raise ReadOnlyError("Diagnostic mode cannot execute commands, including retries")
         request_id = text(request_id, "request_id")
         command = normalize_command(command)
         previous = self._requests.get(request_id)
@@ -173,7 +200,9 @@ class Database:
                 raise ValueError("noncanonical transaction")
             if request_id in self._requests:
                 raise ValueError("duplicate request_id in journal")
-            if self._plan(command, at) != record["result"]:
+            # Python considers True == 1. Stored results must also have the
+            # correct JSON types, not merely compare equal as Python objects.
+            if canonical_json(self._plan(command, at)) != canonical_json(record["result"]):
                 raise ValueError("result contradicts database state")
             self._apply(command, record["result"])
             self._requests[request_id] = record

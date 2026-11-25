@@ -1,7 +1,8 @@
 """Append-only transactions. A newline terminates one complete record.
 
-Only an incomplete final line can be discarded during recovery. A complete
-record with a bad checksum is corruption: opening the database must fail.
+Scanning never changes bytes. After validation, writable recovery can discard
+an incomplete final line and must sync the validated prefix before serving.
+A complete record with a bad checksum is corruption: opening must fail.
 """
 
 import hashlib
@@ -10,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterator
 
-from .errors import AlreadyOpen, CorruptJournal, StorageUnavailable
+from .errors import AlreadyOpen, CorruptJournal, ReadOnlyError, StorageUnavailable
 
 
 def canonical_json(value: Any) -> bytes:
@@ -39,13 +40,16 @@ def decode_json(data: bytes) -> Any:
 class DirectoryLock:
     """An OS lock, released even when the process dies. Never unlink its file."""
 
-    def __init__(self, directory: Path):
-        self._file = open(directory / "owner.lock", "a+b")
+    def __init__(self, directory: Path, *, must_exist: bool = False):
+        # Diagnostic mode locks an existing sidecar without creating or writing
+        # it. Windows still needs a writable descriptor for the exclusive lock.
+        self._file = open(directory / "owner.lock", "r+b" if must_exist else "a+b")
         try:
-            self._file.seek(0, os.SEEK_END)
-            if self._file.tell() == 0:
-                self._file.write(b"\0")
-                self._file.flush()
+            if not must_exist:
+                self._file.seek(0, os.SEEK_END)
+                if self._file.tell() == 0:
+                    self._file.write(b"\0")
+                    self._file.flush()
             self._file.seek(0)
             if os.name == "nt":
                 import msvcrt
@@ -65,32 +69,41 @@ class DirectoryLock:
 
 
 class Journal:
-    def __init__(self, directory: Path):
-        directory.mkdir(parents=True, exist_ok=True)
-        self._lock = DirectoryLock(directory)
+    def __init__(self, directory: Path, *, read_only: bool = False):
+        if not read_only:
+            directory.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
+        self._lock = DirectoryLock(directory, must_exist=read_only)
+        self.total_bytes = 0
+        self.valid_bytes = 0
+        self.valid_records = 0
+        self.incomplete_tail_bytes = 0
         self.recovered_tail_bytes = 0
         self._failed = False
+        self._scanned = False
+        self._ready = False
         try:
-            self._file = open(directory / "transactions.jsonl", "a+b")
+            self._file = open(directory / "transactions.jsonl", "rb" if read_only else "a+b")
+            self.total_bytes = os.fstat(self._file.fileno()).st_size
         except BaseException:
             self._lock.close()
             raise
 
     def transactions(self) -> Iterator[dict[str, Any]]:
+        if self._scanned or self._ready:
+            raise RuntimeError("A journal can only be scanned once per open")
         self._file.seek(0)
         line_number = 0
         while True:
             offset = self._file.tell()
             line = self._file.readline()
             if not line:
+                self._scanned = True
                 return
             line_number += 1
             if not line.endswith(b"\n"):
-                self.recovered_tail_bytes = len(line)
-                self._file.seek(offset)
-                self._file.truncate()
-                self._file.flush()
-                os.fsync(self._file.fileno())
+                self.incomplete_tail_bytes = len(line)
+                self._scanned = True
                 return
             try:
                 envelope = decode_json(line)
@@ -104,11 +117,37 @@ class Journal:
                     raise ValueError("checksum mismatch")
             except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
                 raise CorruptJournal(f"Invalid journal record at line {line_number}: {exc}") from exc
+            self.valid_records += 1
+            self.valid_bytes = offset + len(line)
             yield transaction
 
+    def finish_recovery(self) -> None:
+        """Run only after ALL records pass both storage and domain validation."""
+        if self._read_only:
+            raise ReadOnlyError("Diagnostic mode cannot recover a journal")
+        if not self._scanned:
+            raise RuntimeError("Validate the whole journal before recovery")
+        try:
+            if self.incomplete_tail_bytes:
+                self._file.seek(self.valid_bytes)
+                self._file.truncate()
+            # A complete record may have survived a crash before its original
+            # fsync. Cached replies must not bypass this new durability barrier.
+            self._file.flush()
+            os.fsync(self._file.fileno())
+        except OSError as exc:
+            self._failed = True
+            raise StorageUnavailable("Recovery sync failed; database cannot serve requests") from exc
+        self.recovered_tail_bytes = self.incomplete_tail_bytes
+        self._ready = True
+
     def append(self, transaction: dict[str, Any]) -> None:
+        if self._read_only:
+            raise ReadOnlyError("Diagnostic mode cannot append transactions")
         if self._failed:
             raise StorageUnavailable("Journal failed; close and reopen the database")
+        if not self._ready:
+            raise StorageUnavailable("Journal recovery has not completed")
         payload = canonical_json(transaction)
         line = canonical_json({"sha256": hashlib.sha256(payload).hexdigest(),
                                "transaction": transaction}) + b"\n"

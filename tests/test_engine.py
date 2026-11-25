@@ -243,6 +243,29 @@ db.execute('publish', {'op': 'publish_batch', 'batch_id': 'b1'})
             self.assertEqual(2, len(db.list_slots()))
             self.assertEqual("batch_published", publish(db)["code"])
 
+    def test_recovery_cannot_acknowledge_an_unsynced_record_without_a_durability_barrier(self):
+        with Database(self.path) as db:
+            prepare(db)
+            publish(db)
+        # Exit exactly after flushing a complete reservation, before its fsync.
+        code = """
+import os, sys
+from restaurant_db import Database
+db = Database(sys.argv[1])
+os.fsync = lambda fd: os._exit(23)
+db.execute('book', {'op': 'reserve', 'slot_id': 's1', 'user_id': 'alice'})
+"""
+        child = subprocess.run([sys.executable, "-c", code, str(self.path)],
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(23, child.returncode, child.stderr)
+        with patch("restaurant_db.journal.os.fsync", side_effect=OSError("cannot sync recovered data")):
+            with self.assertRaises(StorageUnavailable):
+                with Database(self.path) as db:
+                    db.execute("book", reserve())
+        with Database(self.path) as db:
+            self.assertEqual("reserved", db.execute("book", reserve())["code"])
+            self.assertEqual(1, len(db.snapshot()["reservations"]))
+
     def test_killing_process_preserves_acknowledged_reservation_and_releases_lock(self):
         with Database(self.path) as db:
             prepare(db)

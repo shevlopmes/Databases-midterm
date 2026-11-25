@@ -36,7 +36,7 @@ def seed(db: Database) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="A single-writer restaurant database")
     sub = parser.add_subparsers(dest="action", required=True)
-    for name in ("seed", "demo", "inspect", "command", "serve"):
+    for name in ("seed", "demo", "inspect", "check", "command", "serve"):
         item = sub.add_parser(name)
         item.add_argument("--data", type=Path, default=Path("data"))
         if name == "command":
@@ -48,6 +48,10 @@ def main() -> int:
             item.add_argument("--max-body-bytes", type=int, default=1024 * 1024)
     args = parser.parse_args()
     try:
+        if args.action == "check":
+            report = Database.check(args.data)
+            emit(report)
+            return 0 if report["status"] == "ok" else 1
         with Database(args.data) as db:
             if db.recovered_tail_bytes:
                 print(f"Recovered incomplete journal tail: {db.recovered_tail_bytes} bytes", file=sys.stderr)
