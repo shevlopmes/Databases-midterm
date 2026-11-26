@@ -1,14 +1,18 @@
 """A local HTTP adapter. HTTPServer intentionally handles one request at a time."""
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import math
 import socket
 from typing import Any
 from urllib.parse import urlsplit
 
+from .auth import AuthStore
 from .engine import Database
-from .errors import IdempotencyConflict, StorageUnavailable, ValidationError
+from .errors import (AuthenticationError, AuthorizationError, IdempotencyConflict,
+                     StorageUnavailable, ValidationError)
 from .journal import canonical_json, decode_json
 from .model import fields
+from .service import CommandService
 
 
 class ReservationServer(HTTPServer):
@@ -16,11 +20,15 @@ class ReservationServer(HTTPServer):
     # small default. This backlog is not a durable or fair business queue.
     request_queue_size = socket.SOMAXCONN
 
-    def __init__(self, address: tuple[str, int], database: Database,
+    def __init__(self, address: tuple[str, int], database: Database, auth: AuthStore,
                  request_timeout: float = 5.0, max_body_bytes: int = 1024 * 1024):
-        if request_timeout <= 0 or max_body_bytes <= 0:
-            raise ValueError("request_timeout and max_body_bytes must be positive")
+        if not math.isfinite(request_timeout) or request_timeout <= 0 or max_body_bytes <= 0:
+            raise ValueError("request_timeout must be finite and positive; max_body_bytes must be positive")
+        if not isinstance(auth, AuthStore):
+            raise ValueError("A valid credentials registry is required")
         self.database = database
+        self.auth = auth
+        self.service = CommandService(database)
         self.request_timeout = request_timeout
         self.max_body_bytes = max_body_bytes
         super().__init__(address, Handler)
@@ -48,6 +56,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
+            if status == 401:
+                self.send_header("WWW-Authenticate", "Bearer")
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -65,8 +75,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, {"ok": False, "code": "recovery_required", "message": str(exc)})
 
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/commands" or "?" in self.path:
+        try:
+            path = urlsplit(self.path).path
+        except ValueError:
+            self._send(400, {"ok": False, "code": "invalid_request", "message": "invalid request target"})
+            return
+        if path != "/commands" or "?" in self.path:
             self._send(404, {"ok": False, "code": "endpoint_not_found"})
+            return
+        try:
+            principal = self.server.auth.authenticate_headers(self.headers.get_all("Authorization", []))
+        except AuthenticationError:
+            self._send(401, {"ok": False, "code": "unauthenticated"})
             return
         if self.headers.get("Transfer-Encoding") is not None:
             self._send(400, {"ok": False, "code": "transfer_encoding_not_supported"})
@@ -92,8 +112,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValidationError("incomplete request body")
             payload = decode_json(raw)
             fields(payload, {"request_id", "command"}, "request")
-            result = self.server.database.execute(payload["request_id"], payload["command"])
-            self._send(200 if result["ok"] else 409, result)
+            result = self.server.service.execute(principal, payload["request_id"], payload["command"])
+            status = 200 if result["ok"] else 403 if result["code"] == "reservation_not_owner" else 409
+            self._send(status, result)
+        except AuthorizationError as exc:
+            self._send(403, {"ok": False, "code": "forbidden", "message": str(exc)})
         except IdempotencyConflict as exc:
             self._send(409, {"ok": False, "code": "idempotency_conflict", "message": str(exc)})
         except StorageUnavailable as exc:

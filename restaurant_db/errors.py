@@ -9,6 +9,18 @@ class ValidationError(DatabaseError):
     pass
 
 
+class AuthenticationError(DatabaseError):
+    pass
+
+
+class AuthorizationError(DatabaseError):
+    pass
+
+
+class AuthConfigurationError(DatabaseError):
+    pass
+
+
 class AlreadyOpen(DatabaseError):
     pass
 

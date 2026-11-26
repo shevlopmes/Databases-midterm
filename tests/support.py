@@ -1,6 +1,9 @@
 """Keep disposable test files inside the project, including in restricted shells."""
 
 from pathlib import Path
+import hashlib
+import json
+import secrets
 import shutil
 import uuid
 
@@ -19,3 +22,13 @@ def test_directory(case) -> Path:
 
     case.addCleanup(cleanup)
     return path
+
+
+def write_credentials(path: Path, user_ids) -> dict[str, str]:
+    """Create test-only secrets; only verifiers enter the registry on disk."""
+    tokens = {user_id: secrets.token_urlsafe(32) for user_id in user_ids}
+    payload = {"version": 1, "users": [
+        {"user_id": user_id, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+        for user_id, token in tokens.items()]}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return tokens

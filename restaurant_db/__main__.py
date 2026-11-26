@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 
+from .auth import AuthStore, issue_token, revoke_token
 from .engine import Database
 from .errors import DatabaseError
 from .journal import decode_json
@@ -43,15 +44,31 @@ def main() -> int:
             item.add_argument("--request-id", required=True)
             item.add_argument("--file", type=Path, help="Command JSON; omitted means stdin")
         elif name == "serve":
+            item.add_argument("--auth-file", type=Path, default=Path("auth/users.json"))
             item.add_argument("--port", type=int, default=8080)
             item.add_argument("--request-timeout", type=float, default=5.0)
             item.add_argument("--max-body-bytes", type=int, default=1024 * 1024)
+    for name in ("auth-issue", "auth-revoke"):
+        item = sub.add_parser(name)
+        item.add_argument("--auth-file", type=Path, default=Path("auth/users.json"))
+        item.add_argument("--user-id", required=True)
     args = parser.parse_args()
     try:
+        if args.action == "auth-issue":
+            token = issue_token(args.auth_file, args.user_id)
+            emit({"user_id": args.user_id, "token": token})
+            print("Restart the server to apply credentials changes. Keep the token secret.", file=sys.stderr)
+            return 0
+        if args.action == "auth-revoke":
+            revoke_token(args.auth_file, args.user_id)
+            emit({"user_id": args.user_id, "revoked": True, "restart_required": True})
+            return 0
         if args.action == "check":
             report = Database.check(args.data)
             emit(report)
             return 0 if report["status"] == "ok" else 1
+        # Validate credentials before opening or creating the data directory.
+        auth = AuthStore.load(args.auth_file) if args.action == "serve" else None
         with Database(args.data) as db:
             if db.recovered_tail_bytes:
                 print(f"Recovered incomplete journal tail: {db.recovered_tail_bytes} bytes", file=sys.stderr)
@@ -71,7 +88,7 @@ def main() -> int:
                 emit(result)
                 return 0 if result["ok"] else 1
             elif args.action == "serve":
-                with ReservationServer(("127.0.0.1", args.port), db,
+                with ReservationServer(("127.0.0.1", args.port), db, auth,
                                        args.request_timeout, args.max_body_bytes) as server:
                     emit({"listening": f"http://127.0.0.1:{server.server_port}", "single_writer": True})
                     try:

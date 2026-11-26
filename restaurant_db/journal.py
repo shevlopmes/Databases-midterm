@@ -40,10 +40,10 @@ def decode_json(data: bytes) -> Any:
 class DirectoryLock:
     """An OS lock, released even when the process dies. Never unlink its file."""
 
-    def __init__(self, directory: Path, *, must_exist: bool = False):
+    def __init__(self, directory: Path, *, must_exist: bool = False, filename: str = "owner.lock"):
         # Diagnostic mode locks an existing sidecar without creating or writing
         # it. Windows still needs a writable descriptor for the exclusive lock.
-        self._file = open(directory / "owner.lock", "r+b" if must_exist else "a+b")
+        self._file = open(directory / filename, "r+b" if must_exist else "a+b")
         try:
             if not must_exist:
                 self._file.seek(0, os.SEEK_END)

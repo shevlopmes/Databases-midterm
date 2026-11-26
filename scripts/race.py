@@ -4,6 +4,9 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
+from pathlib import Path
+import re
 import threading
 import time
 from urllib.error import HTTPError, URLError
@@ -15,19 +18,33 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--slot-id", default="s1")
+    parser.add_argument("--tokens-file", type=Path, required=True,
+                        help="Private JSON object mapping user labels to issued tokens")
     parser.add_argument("--clients", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
-    if args.clients <= 0 or args.timeout <= 0:
-        parser.error("clients and timeout must be positive")
+    if args.clients <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("clients must be positive; timeout must be finite and positive")
+    try:
+        credentials = json.loads(args.tokens_file.read_bytes())
+        if not isinstance(credentials, dict) or not credentials:
+            raise ValueError("empty credentials")
+        if any(not isinstance(user, str) or not user or not isinstance(token, str)
+               or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
+               for user, token in credentials.items()):
+            raise ValueError("invalid credential")
+        tokens = [token for _, token in sorted(credentials.items())]
+    except (OSError, ValueError, UnicodeError):
+        parser.error("tokens-file must contain a nonempty JSON object of issued tokens")
     barrier = threading.Barrier(args.clients)
     run_id = uuid.uuid4().hex
 
     def reserve(index: int) -> tuple[str, float]:
         body = json.dumps({"request_id": f"{run_id}.{index}", "command": {
-            "op": "reserve", "slot_id": args.slot_id, "user_id": f"client-{index}"}}).encode()
+            "op": "reserve", "slot_id": args.slot_id}}).encode()
         request = Request(args.url.rstrip("/") + "/commands", data=body,
-                          headers={"Content-Type": "application/json"})
+                          headers={"Content-Type": "application/json",
+                                   "Authorization": f"Bearer {tokens[index % len(tokens)]}"})
         barrier.wait()
         start = time.perf_counter()
         try:

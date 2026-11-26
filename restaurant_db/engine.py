@@ -8,7 +8,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from .errors import (CorruptJournal, IdempotencyConflict, OwnershipError,
+from .errors import (AuthorizationError, CorruptJournal, IdempotencyConflict, OwnershipError,
                      ReadOnlyError, StorageUnavailable, ValidationError)
 from .journal import Journal, canonical_json
 from .model import Batch, Reservation, Slot, Table, normalize_command, text, timestamp
@@ -41,7 +41,8 @@ class Database:
         # Creation history stays immutable; cancellation records its own time.
         self._cancelled: dict[int, str] = {}
         self._active: dict[str, int] = {}
-        self._requests: dict[str, dict[str, Any]] = {}
+        # None is the legacy/local namespace; authenticated actors get their own.
+        self._requests: dict[tuple[str | None, str], dict[str, Any]] = {}
         self._next_reservation_id = 1
         self._journal = Journal(Path(directory), read_only=read_only)
         try:
@@ -89,12 +90,26 @@ class Database:
             raise StorageUnavailable("Database needs recovery; close and reopen it")
 
     def execute(self, request_id: str, command: dict[str, Any]) -> dict[str, Any]:
+        """Trusted local entry point; preserves version-1 request semantics."""
+        return self._execute(request_id, command, actor_id=None)
+
+    def execute_user(self, actor_id: str, request_id: str, command: dict[str, Any]) -> dict[str, Any]:
+        """Called by the trusted service AFTER authentication, not a token check."""
+        self._check_owner()
+        actor_id = text(actor_id, "actor_id")
+        command = normalize_command(command)
+        if command["op"] not in ("reserve", "cancel") or command["user_id"] != actor_id:
+            raise AuthorizationError("Command does not belong to the authenticated user")
+        return self._execute(request_id, command, actor_id=actor_id)
+
+    def _execute(self, request_id: str, command: dict[str, Any], *, actor_id: str | None) -> dict[str, Any]:
         self._check_owner()
         if self._read_only:
             raise ReadOnlyError("Diagnostic mode cannot execute commands, including retries")
         request_id = text(request_id, "request_id")
         command = normalize_command(command)
-        previous = self._requests.get(request_id)
+        key = (actor_id, request_id)
+        previous = self._requests.get(key)
         if previous is not None:
             if previous["command"] != command:
                 raise IdempotencyConflict("request_id was already used for a different command")
@@ -104,11 +119,13 @@ class Database:
         result = self._plan(command, at)
         record = {"version": 1, "request_id": request_id, "at": at,
                   "command": command, "result": result}
+        if actor_id is not None:
+            record.update(version=2, actor_id=actor_id)
         try:
             # No reader can run between planning, durability and applying state.
             self._journal.append(record)
             self._apply(command, result)
-            self._requests[request_id] = record
+            self._requests[key] = record
         except BaseException:
             self._failed = True
             raise
@@ -210,23 +227,32 @@ class Database:
 
     def _replay(self, record: dict[str, Any]) -> None:
         try:
-            if set(record) != {"version", "request_id", "at", "command", "result"}:
-                raise ValueError("invalid transaction fields")
-            if type(record["version"]) is not int or record["version"] != 1:
+            version = record.get("version")
+            if type(version) is not int or version not in (1, 2):
                 raise ValueError("unsupported transaction version")
+            expected = {"version", "request_id", "at", "command", "result"}
+            if version == 2:
+                expected.add("actor_id")
+            if set(record) != expected:
+                raise ValueError("invalid transaction fields")
             request_id = text(record["request_id"], "request_id")
+            actor_id = text(record["actor_id"], "actor_id") if version == 2 else None
             at = timestamp(record["at"], "at")
             command = normalize_command(record["command"])
+            if actor_id is not None and (command["op"] not in ("reserve", "cancel")
+                                         or command["user_id"] != actor_id):
+                raise ValueError("invalid authenticated command")
             if command != record["command"] or at != record["at"]:
                 raise ValueError("noncanonical transaction")
-            if request_id in self._requests:
+            key = (actor_id, request_id)
+            if key in self._requests:
                 raise ValueError("duplicate request_id in journal")
             # Python considers True == 1. Stored results must also have the
             # correct JSON types, not merely compare equal as Python objects.
             if canonical_json(self._plan(command, at)) != canonical_json(record["result"]):
                 raise ValueError("result contradicts database state")
             self._apply(command, record["result"])
-            self._requests[request_id] = record
+            self._requests[key] = record
         except (ValueError, KeyError, TypeError, ValidationError) as exc:
             raise CorruptJournal(f"Invalid transaction: {exc}") from exc
 
